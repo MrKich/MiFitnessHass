@@ -206,6 +206,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         self._day_num: int = 0      # calendar day when _day_wm was recorded
         self._sensor_data: dict[str, Any] = {}
         self._sleep_history: dict[str, dict] = {}
+        self._sleep_sessions: dict[str, dict] = {}
         self._steps_history: dict[str, dict] = {}
         # Per-day step records keyed by timestamp: {date_str: {ts: {...}}}.
         # The server re-sends the same interval with a new watermark as data
@@ -227,6 +228,11 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
             self._day_wm        = stored.get("day_wm", 0)
             self._day_num       = stored.get("day_num", 0)
             self._sleep_history = stored.get("sleep_history", {})
+            self._sleep_sessions = {
+                str(record["bedtime"]): record
+                for record in self._sleep_history.values() if record.get("bedtime")
+            }
+            self._sleep_sessions.update(stored.get("sleep_sessions", {}))
             self._steps_history = stored.get("steps_history", {})
             self._step_buckets  = stored.get("step_buckets", {})
             self._sensor_data   = stored.get("sensor_data", {})
@@ -318,6 +324,9 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         except MiFitnessApiError as exc:
             raise UpdateFailed(str(exc)) from exc
 
+        if items:
+            self._merge_items(items)
+
         if new_wm and new_wm != self._watermark:
             self._watermark = new_wm
             today = _local_day_num()
@@ -330,6 +339,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                 "day_wm":        self._day_wm,
                 "day_num":       self._day_num,
                 "sleep_history": self._sleep_history,
+                "sleep_sessions": self._sleep_sessions,
                 "steps_history": self._steps_history,
                 "step_buckets":  self._step_buckets,
                 "sensor_data":   self._sensor_data,
@@ -338,7 +348,6 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         # Dynamic interval: catching up → 30 s, up to date → 15 min,
         # repeated failures → exponential backoff (don't hammer a rate-limit).
         if items:
-            self._merge_items(items)
             self._fetch_errors = 0
             latest_ts = max(
                 (item.get("time") or item.get("update_time") or 0) for item in items
@@ -439,7 +448,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
 
             # ── Sleep ─────────────────────────────────────────────────────
             elif key == KEY_SLEEP:
-                if ts >= recent_cutoff:
+                if ts >= now - 30 * 86400:
                     self._process_sleep(val, ts)
 
             # ── Calories ──────────────────────────────────────────────────
@@ -539,6 +548,9 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         # Rebuild history + compute chronotype from full history (not single night)
         history_list = self._build_sleep_history_list()
         self._sensor_data["sleep_history_14d"] = history_list
+        self._sensor_data["sleep_sessions_30d"] = sorted(
+            self._sleep_sessions.values(), key=lambda record: record["bedtime"], reverse=True
+        )
         if history_list:
             self._sensor_data["sleep_chronotype"] = _sleep_chronotype_6(history_list)
 
@@ -552,13 +564,10 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         if not bedtime:
             return
 
-        # Only update current sleep record if this is newer
-        prev_bedtime = self._sensor_data.get("sleep_bedtime", 0)
-        if bedtime <= prev_bedtime:
-            return
-
         wakeup      = val.get("wake_up_time", 0)
         duration    = val.get("duration", 0)
+        if not wakeup or wakeup <= bedtime or duration <= 0:
+            return
         deep        = val.get("sleep_deep_duration", 0)
         light       = val.get("sleep_light_duration", 0)
         rem         = val.get("sleep_rem_duration", val.get("rem_duration", 0))
@@ -572,6 +581,32 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         stages     = _stages_to_list(stages_raw) if stages_raw else []
         time_in_bed = (wakeup - bedtime) / 60 if wakeup > bedtime else duration
         efficiency  = round(duration / time_in_bed * 100) if time_in_bed > 0 else 0
+
+        session_key = str(bedtime)
+        previous = self._sleep_sessions.get(session_key, {})
+        if ts < previous.get("updated_at", 0):
+            return
+        self._sleep_sessions[session_key] = {
+            "bedtime": bedtime, "wakeup": wakeup, "duration": duration,
+            "deep": deep, "light": light, "rem": rem,
+            "awake_count": awake_count, "quality": quality,
+            "efficiency": efficiency, "updated_at": ts,
+            "is_uncomplete": bool(val.get("is_uncomplete", False)),
+            "in_bed_at": val.get("bed_timestamp"),
+            "out_of_bed_at": val.get("out_bed_timestamp"),
+        }
+        cutoff_ts = time.time() - 30 * 86400
+        self._sleep_sessions = {
+            key: record for key, record in self._sleep_sessions.items()
+            if record["wakeup"] >= cutoff_ts
+        }
+
+        # Archive every session; current sensors track the most recent bedtime.
+        prev_bedtime = self._sensor_data.get("sleep_bedtime", 0)
+        if bedtime < prev_bedtime or (
+            bedtime == prev_bedtime and ts < self._sensor_data.get("sleep_ts", 0)
+        ):
+            return
 
         self._sensor_data.update({
             "sleep_bedtime":     bedtime,
