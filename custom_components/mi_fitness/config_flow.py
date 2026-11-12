@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import voluptuous as vol
@@ -64,7 +65,13 @@ async def _test_tokens(hass, data: dict) -> None:
         service_token=data[CONF_SERVICE_TOKEN],
         region=data.get(CONF_REGION, DEFAULT_REGION),
     )
-    await hass.async_add_executor_job(client.get_health_data, 0, 1)
+    # A single small window is enough to prove the session works: it exercises
+    # the signed POST transport and the session cookies against the real data
+    # endpoint.
+    end_ts = int(time.time())
+    await hass.async_add_executor_job(
+        client.fetch_key_window, "steps", end_ts - 2 * 86400, end_ts
+    )
 
 
 # ── Config flow ───────────────────────────────────────────────────────────────

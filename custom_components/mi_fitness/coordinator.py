@@ -27,7 +27,6 @@ from .const import (
     CONF_SERVICE_TOKEN,
     CONF_SSECURITY,
     CONF_USER_ID,
-    DEFAULT_START_WATERMARK,
     DOMAIN,
     KEY_CALORIES,
     KEY_HEART_RATE,
@@ -39,6 +38,8 @@ from .const import (
     KEY_VITALITY,
     KEY_VALID_STAND,
     KEY_WEIGHT,
+    INITIAL_WINDOW_DAYS,
+    REFRESH_WINDOW_DAYS,
     SCAN_INTERVAL_MINUTES,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -220,15 +221,13 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         self._entry = entry
         self._entry_id = entry.entry_id
         self._store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}")
-        self._watermark: int = 0
-        self._day_wm: int = 0       # watermark saved at start of each new day
-        self._day_num: int = 0      # calendar day when _day_wm was recorded
+        self._day_num: int = 0      # calendar day of the last poll (daily reset)
         self._sensor_data: dict[str, Any] = {}
         self._sleep_history: dict[str, dict] = {}
         self._sleep_sessions: dict[str, dict] = {}
         self._steps_history: dict[str, dict] = {}
         # Per-day step records keyed by timestamp: {date_str: {ts: {...}}}.
-        # The server re-sends the same interval with a new watermark as data
+        # The server re-sends the same interval again as data accumulates,
         # accumulates, so we DEDUPE by ts (replace) instead of summing.
         self._step_buckets: dict[str, dict] = {}
         # Readings per metric and UTC hour: {metric: {hour_start_ts: {ts: value}}},
@@ -249,8 +248,6 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         """
         stored = await self._store.async_load()
         if stored:
-            self._watermark     = stored.get("watermark", 0)
-            self._day_wm        = stored.get("day_wm", 0)
             self._day_num       = stored.get("day_num", 0)
             self._sleep_history = stored.get("sleep_history", {})
             self._sleep_sessions = {
@@ -265,19 +262,6 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
             self._pending_step_dates = set(self._step_buckets)
             self._stat_buckets  = stored.get("stat_buckets", {})
             self._sensor_data   = stored.get("sensor_data", {})
-            # On restart roll back to start-of-today so we re-fetch today's data.
-            # (watermark sits at end-of-data; day_wm is start-of-today.)
-            if self._day_wm:
-                self._watermark = self._day_wm
-                # Clear today's step totals — they'll be rebuilt from re-fetched records.
-                # (Avoids double-counting since we accumulate into _steps_history.)
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                self._steps_history.pop(today_str, None)
-                for _k in ("steps_today", "distance_today", "step_calories_today", "steps_hourly"):
-                    self._sensor_data.pop(_k, None)
-            elif self._watermark == 0:
-                # First-ever install: skip ancient history, start ~30 days ago
-                self._watermark = DEFAULT_START_WATERMARK
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch new data from API and merge into sensor state."""
@@ -297,17 +281,20 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
             ):
                 self._sensor_data.pop(_k, None)
 
-        # First refresh: fetch only 1 page to verify connectivity fast
-        # (avoids CancelledError timeout during async_config_entry_first_refresh)
-        # Subsequent polls: 30 pages to catch up through historical data quickly
-        max_pages = 1 if not self._initial_load_done else 30
+        # Read a time window. The legacy incremental endpoint
+        # (get_fitness_data_by_watermark) is a frozen stream for some accounts,
+        # so every poll reads by time range instead: the first one covers
+        # INITIAL_WINDOW_DAYS of history, later ones a short overlap window.
+        days = INITIAL_WINDOW_DAYS if not self._initial_load_done else REFRESH_WINDOW_DAYS
         self._initial_load_done = True
+        end_ts = int(time.time())
+        start_ts = end_ts - days * 86400
 
         try:
-            items, new_wm, errored = await self.hass.async_add_executor_job(
-                self._client.fetch_all_since,
-                self._watermark,
-                max_pages,
+            items, errored = await self.hass.async_add_executor_job(
+                self._client.fetch_window,
+                start_ts,
+                end_ts,
             )
         except MiFitnessAuthError as exc:
             # ── Try silent serviceToken refresh using stored passToken ──────────
@@ -391,27 +378,19 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     SCAN_INTERVAL_MINUTES,
                 )
 
-        # Persist only after merging, so the stored state matches the stored
-        # watermark. Saving before the merge kept the previous poll's state,
-        # and a restart then lost what this poll had merged.
-        if new_wm and new_wm != self._watermark:
-            self._watermark = new_wm
-            today = _local_day_num()
-            if today != self._day_num:
-                # New day — snapshot watermark so restart can roll back to here
-                self._day_wm  = new_wm
-                self._day_num = today
-            await self._store.async_save({
-                "watermark":     new_wm,
-                "day_wm":        self._day_wm,
-                "day_num":       self._day_num,
-                "sleep_history": self._sleep_history,
-                "sleep_sessions": self._sleep_sessions,
-                "steps_history": self._steps_history,
-                "step_buckets":  self._step_buckets,
-                "stat_buckets":  self._stat_buckets,
-                "sensor_data":   self._sensor_data,
-            })
+        # Persist merged state so a restart keeps what this poll produced.
+        today = _local_day_num()
+        if today != self._day_num:
+            self._day_num = today
+        await self._store.async_save({
+            "day_num":        self._day_num,
+            "sleep_history":  self._sleep_history,
+            "sleep_sessions": self._sleep_sessions,
+            "steps_history":  self._steps_history,
+            "step_buckets":   self._step_buckets,
+            "stat_buckets":   self._stat_buckets,
+            "sensor_data":    self._sensor_data,
+        })
 
         return dict(self._sensor_data)
 
@@ -422,7 +401,8 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         tomorrow  = today + 86400
 
         # Cutoffs: ignore stale data for sensor VALUES.
-        # The watermark still advances so we never re-fetch these items.
+        # The window is re-read on every poll, so items outside these cutoffs
+        # are merged into history/statistics only, never into current values.
         # "recent" sensors (HR, sleep, vitality): 14 days
         # "infrequent" sensors (weight, SpO2): 90 days
         recent_cutoff = now - 14 * 86400
@@ -448,7 +428,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                         date_str, hour, val.get("steps"), val.get("distance"),
                     )
                     # Dedupe by timestamp: the server re-sends the same interval
-                    # with a new watermark as data accumulates. REPLACE (not add),
+                    # The server re-sends the same interval as data accumulates. REPLACE (not add),
                     # otherwise a day inflates by the number of re-sends.
                     day = self._step_buckets.setdefault(date_str, {})
                     day[str(ts)] = {

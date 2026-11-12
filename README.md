@@ -29,6 +29,10 @@ which device produced it.
 - Sensors: steps, distance, calories, heart rate (avg/max/min/resting), sleep
   (duration, stages, quality, chronotype), vitality, stand hours, SpO₂, stress,
   weight.
+- Data is read by **time window** (`get_fitness_data_by_time`), three days per
+  poll and fourteen days on the first poll. The old incremental watermark
+  endpoint is no longer used: Xiaomi keeps it frozen on a fixed date for some
+  accounts, which left every sensor unavailable.
 - Long-term statistics from every synced reading: hourly heart rate and SpO₂
   (mean/min/max) and steps — see [History statistics](#history-statistics).
 - Silent token refresh using `passToken` — survives `serviceToken` expiry

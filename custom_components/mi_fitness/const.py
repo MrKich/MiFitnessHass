@@ -27,14 +27,13 @@ DEFAULT_REGION = "de"
 
 SCAN_INTERVAL_MINUTES = 15
 
-# Approximate watermark corresponding to ~30 days before 2026-05-30.
-# Used as the default starting point on first install so users don't scan
-# from absolute zero. Xiaomi watermarks are global sequential IDs (~78B/day).
-# Update this value with each major release.
-DEFAULT_START_WATERMARK = 157_500_000_000_000
+# Time windows read on every poll. The cloud is queried by range
+# (get_fitness_data_by_time), not by an incremental watermark.
+INITIAL_WINDOW_DAYS = 14   # first poll after a start/reload
+REFRESH_WINDOW_DAYS = 3    # every later poll (overlap absorbs late syncs)
 
-STORAGE_KEY = "mi_fitness_watermarks"
-STORAGE_VERSION = 1
+STORAGE_KEY = "mi_fitness_state"
+STORAGE_VERSION = 2
 
 # Sensor keys in the API response
 KEY_STEPS              = "steps"
@@ -47,6 +46,21 @@ KEY_VITALITY           = "vitality"
 KEY_VALID_STAND        = "valid_stand"
 KEY_SPO2               = "spo2"
 KEY_STRESS             = "stress"
+
+# Metrics requested for every window. Keys an account does not produce
+# (for example sleep or weight without the matching device) simply return
+# an empty page and are ignored.
+LIVE_DATA_KEYS = (
+    KEY_STEPS,
+    KEY_CALORIES,
+    KEY_HEART_RATE,
+    KEY_RESTING_HEART_RATE,
+    KEY_SPO2,
+    KEY_STRESS,
+    KEY_VALID_STAND,
+    KEY_VITALITY,
+    KEY_WEIGHT,
+)
 
 # Device info
 DEVICE_MANUFACTURER = "Xiaomi"

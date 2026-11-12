@@ -1,10 +1,16 @@
 """
 Mi Fitness cloud API client.
 
-Endpoint: GET https://{region}.hlth.io.mi.com/app/v1/data/get_fitness_data_by_watermark
+Endpoint: POST https://{region}.hlth.io.mi.com/app/v1/data/get_fitness_data_by_time
           (cn region serves the same API from the bare host hlth.io.mi.com,
           see _api_host below)
-Auth:     RC4 + SHA1 MAC signing scheme
+
+The legacy incremental endpoint ``get_fitness_data_by_watermark`` is no longer
+used: Xiaomi stopped appending to that stream for some accounts (it freezes on
+a fixed date), while ``get_fitness_data_by_time`` keeps returning current data.
+Requests are therefore windowed by time and paginated with ``next_key``.
+
+Auth: RC4 + SHA1 MAC signing scheme (signed body, see _post)
 """
 
 from __future__ import annotations
@@ -15,12 +21,14 @@ import json
 import logging
 import random
 import time
-from urllib.parse import urlparse
 
 import requests
 from Crypto.Cipher import ARC4
 
+from .const import LIVE_DATA_KEYS
+
 _LOGGER = logging.getLogger(__name__)
+
 
 def _rand_hex(n: int = 32) -> str:
     """Random lowercase hex string of length n."""
@@ -58,13 +66,12 @@ def _signed_nonce(ssecurity: str, nonce: str) -> str:
     return base64.b64encode(h.digest()).decode()
 
 
-def _fc4_sign(method: str, url: str, params: dict, security: str) -> str:
+def _fc4_sign(method: str, path: str, params: dict, security: str) -> str:
     """
     Request signing:
       SHA1(METHOD & /path & k=v & ... & security) → base64
     Params sorted lexicographically.
     """
-    path = urlparse(url).path
     parts = [method.upper(), path]
     for k, v in sorted(params.items()):
         parts.append(f"{k}={v}")
@@ -86,35 +93,13 @@ def _decrypt_rc4(key_b64: str, payload_b64: str) -> bytes:
     return r.encrypt(base64.b64decode(payload_b64))
 
 
-def _build_get_params(url: str, data_obj: dict, ssecurity: str) -> tuple[dict, str]:
-    """Build signed GET query params. Returns (params_dict, signed_nonce)."""
-    nonce  = _gen_nonce()
-    snonce = _signed_nonce(ssecurity, nonce)
-    data_str = json.dumps(data_obj, separators=(",", ":"))
-
-    plain    = {"data": data_str}
-    rc4_hash = _fc4_sign("GET", url, plain, snonce)
-
-    enc_data     = _encrypt_rc4(snonce, data_str)
-    enc_rc4_hash = _encrypt_rc4(snonce, rc4_hash)
-
-    enc_params = {"data": enc_data, "rc4_hash__": enc_rc4_hash}
-    signature  = _fc4_sign("GET", url, enc_params, snonce)
-
-    params = {
-        "data":       enc_data,
-        "rc4_hash__": enc_rc4_hash,
-        "signature":  signature,
-        "ssecurity":  ssecurity,
-        "_nonce":     nonce,
-    }
-    return params, snonce
-
-
 # ── Client ───────────────────────────────────────────────────────────────────
 
 class MiFitnessClient:
-    """Async-capable Xiaomi health data client for hlth.io.mi.com."""
+    """Xiaomi health data client for hlth.io.mi.com (sync, run in executor)."""
+
+    PATH_BY_TIME = "/app/v1/data/get_fitness_data_by_time"
+    MAX_PAGES_PER_KEY = 60
 
     def __init__(
         self,
@@ -130,7 +115,7 @@ class MiFitnessClient:
         self.ssecurity     = ssecurity
         self.service_token = service_token
         self.region        = region
-        self.phone_id      = phone_id
+        self.phone_id      = phone_id   # kept for config compatibility, unused
 
         # cn region: cn.hlth.io.mi.com does not resolve; the bare host serves CN data
         self._api_host = "hlth.io.mi.com" if region == "cn" else f"{region}.hlth.io.mi.com"
@@ -155,108 +140,104 @@ class MiFitnessClient:
         s.cookies.set("cUserId",      self.c_user_id,     domain=domain)
         s.cookies.set("serviceToken", self.service_token, domain=domain)
         s.cookies.set("locale",       "de_de",            domain=domain)
-        _LOGGER.warning(
-            "API session: region=%s user_id=%s c_user_id=%s "
-            "ssec_len=%d tok_len=%d",
+        _LOGGER.debug(
+            "API session: region=%s user_id=%s c_user_id=%s ssec_len=%d tok_len=%d",
             self.region, self.user_id, self.c_user_id,
             len(self.ssecurity), len(self.service_token),
         )
         return s
 
-    def _get(self, path: str, data_obj: dict) -> dict:
-        """Signed GET, decrypt RC4 response, return parsed JSON."""
-        url = f"{self._base}{path}"
-        params, snonce = _build_get_params(url, data_obj, self.ssecurity)
+    def _post(self, path: str, payload: dict) -> dict:
+        """Signed POST, decrypt RC4 response, return the ``result`` object."""
+        nonce  = _gen_nonce()
+        snonce = _signed_nonce(self.ssecurity, nonce)
+
+        form = {"data": json.dumps(payload, separators=(",", ":"))}
+        form["rc4_hash__"] = _fc4_sign("POST", path, form, snonce)
+        encrypted = {k: _encrypt_rc4(snonce, v) for k, v in form.items()}
+        encrypted["signature"] = _fc4_sign("POST", path, encrypted, snonce)
+        encrypted["_nonce"] = nonce
+
         try:
-            r = self._session.get(url, params=params, timeout=20)
+            r = self._session.post(self._base + path, data=encrypted, timeout=25)
         except requests.RequestException as exc:
             raise MiFitnessApiError(f"Network error: {exc}") from exc
 
         if r.status_code == 401:
-            _LOGGER.error("HTTP 401 body=%s  url=%s", r.text[:300], r.url)
+            _LOGGER.error("HTTP 401 path=%s body=%s", path, r.text[:300])
             raise MiFitnessAuthError("serviceToken expired (HTTP 401)")
         if r.status_code != 200:
             raise MiFitnessApiError(f"HTTP {r.status_code}: {r.text[:200]}")
 
         try:
-            plaintext = _decrypt_rc4(snonce, r.text.strip())
-            return json.loads(plaintext)
+            body = json.loads(_decrypt_rc4(snonce, r.text.strip()))
         except Exception as exc:
-            raise MiFitnessApiError(f"Decrypt/parse failed: {exc} raw={r.text[:100]}") from exc
+            raise MiFitnessApiError(
+                f"Decrypt/parse failed: {exc} raw={r.text[:100]}"
+            ) from exc
+
+        code = body.get("code", -1)
+        if code != 0:
+            raise MiFitnessApiError(f"API error code {code} on {path}: {body}")
+        return body.get("result") or {}
 
     # ── Public methods ───────────────────────────────────────────────────────
 
-    def get_health_data(self, watermark: int = 0, limit: int = 50) -> dict:
-        """
-        Fetch health data items since watermark.
-        Returns raw API result dict with keys: data_list, has_more, watermark.
-        """
-        result = self._get(
-            "/app/v1/data/get_fitness_data_by_watermark",
-            {"userid": self.user_id, "limit": limit, "watermark": watermark},
-        )
-        code = result.get("code", -1)
-        if code != 0:
-            raise MiFitnessApiError(f"API error code {code}: {result}")
-        return result.get("result", {})
+    def get_data_by_time(
+        self,
+        key: str,
+        start_ts: int,
+        end_ts: int,
+        next_key: str | None = None,
+    ) -> dict:
+        """One page of records for ``key`` in [start_ts, end_ts]."""
+        payload: dict = {
+            "start_time": int(start_ts),
+            "end_time":   int(end_ts),
+            "key":        key,
+        }
+        if next_key:
+            payload["next_key"] = next_key
+        return self._post(self.PATH_BY_TIME, payload)
 
-    def get_daily_markers(self, watermark: int = 0) -> list[dict]:
-        """
-        Fetch daily_mark presence indicators (which days have data for each metric).
-        Returns list of marker items.
-        """
-        result = self._get(
-            "/app/v1/data/get_aggregated_fitness_data_by_watermark",
-            {
-                "userid":   self.user_id,
-                "tag":      "daily_mark",
-                "phone_id": self.phone_id,
-                "limit":    50,
-                "watermark": watermark,
-            },
-        )
-        code = result.get("code", -1)
-        if code != 0:
-            _LOGGER.warning("daily_mark error code %s", code)
-            return []
-        r = result.get("result") or {}
-        return r.get("data_list", [])
-
-    def fetch_all_since(
-        self, watermark: int, max_pages: int = 10
-    ) -> tuple[list[dict], int, bool]:
-        """
-        Paginate through get_fitness_data_by_watermark.
-        Returns (all_items, new_watermark, errored).
-
-        `errored` is True if a page failed after retries — the caller must NOT
-        treat the (possibly empty) result as "fully caught up", otherwise a
-        transient network blip silently stalls polling until a reload.
-        """
+    def fetch_key_window(self, key: str, start_ts: int, end_ts: int) -> list[dict]:
+        """All records for one key in the window, following ``next_key``."""
         items: list[dict] = []
-        wm = watermark
+        next_key: str | None = None
+        for _ in range(self.MAX_PAGES_PER_KEY):
+            result = self.get_data_by_time(key, start_ts, end_ts, next_key)
+            page = result.get("data_list") or []
+            items.extend(page)
+            cursor = result.get("next_key")
+            if not result.get("has_more") or not cursor:
+                break
+            next_key = str(cursor)
+            time.sleep(0.15)   # be gentle: avoid hammering / rate-limit
+        return items
+
+    def fetch_window(
+        self,
+        start_ts: int,
+        end_ts: int,
+        keys: tuple[str, ...] | list[str] | None = None,
+    ) -> tuple[list[dict], bool]:
+        """
+        Fetch every configured metric for [start_ts, end_ts].
+
+        Returns (items, errored). ``errored`` is True when at least one key
+        failed, so the caller does not mistake a partial result for a complete
+        one. Items keep the shape produced by the cloud:
+        {sid, key, time, value (JSON string), zone_offset, zone_name, update_time}.
+        """
+        keys = tuple(keys or LIVE_DATA_KEYS)
+        items: list[dict] = []
         errored = False
-        for _ in range(max_pages):
-            page = None
-            for attempt in range(3):
-                try:
-                    page = self.get_health_data(watermark=wm)
-                    break
-                except MiFitnessAuthError:
-                    raise   # let coordinator handle 401 → silent refresh
-                except MiFitnessApiError as exc:
-                    _LOGGER.warning(
-                        "fetch_all_since page error (attempt %d/3): %s", attempt + 1, exc
-                    )
-                    time.sleep(1.5 * (attempt + 1))
-            if page is None:
+        for key in keys:
+            try:
+                items.extend(self.fetch_key_window(key, start_ts, end_ts))
+            except MiFitnessAuthError:
+                raise   # let the coordinator handle 401 → silent refresh
+            except MiFitnessApiError as exc:
                 errored = True
-                break
-            dl = page.get("data_list") or []
-            new_wm = page.get("watermark", wm)
-            items.extend(dl)
-            wm = new_wm
-            if not page.get("has_more") or not dl:
-                break
-            time.sleep(0.3)   # be gentle: avoid hammering / rate-limit during catch-up
-        return items, wm, errored
+                _LOGGER.warning("fetch window key=%s failed: %s", key, exc)
+        return items, errored
