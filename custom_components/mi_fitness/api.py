@@ -5,11 +5,7 @@ Endpoint: POST https://{region}.hlth.io.mi.com/app/v1/data/get_fitness_data_by_t
           (cn region serves the same API from the bare host hlth.io.mi.com,
           see _api_host below)
 
-The legacy incremental endpoint ``get_fitness_data_by_watermark`` is no longer
-used: Xiaomi stopped appending to that stream for some accounts (it freezes on
-a fixed date), while ``get_fitness_data_by_time`` keeps returning current data.
-Requests are therefore windowed by time and paginated with ``next_key``.
-
+Requests are windowed by time and paginated with ``next_key``.
 Auth: RC4 + SHA1 MAC signing scheme (signed body, see _post)
 """
 
@@ -140,7 +136,7 @@ class MiFitnessClient:
         s.cookies.set("cUserId",      self.c_user_id,     domain=domain)
         s.cookies.set("serviceToken", self.service_token, domain=domain)
         s.cookies.set("locale",       "de_de",            domain=domain)
-        _LOGGER.debug(
+        _LOGGER.info(
             "API session: region=%s user_id=%s c_user_id=%s ssec_len=%d tok_len=%d",
             self.region, self.user_id, self.c_user_id,
             len(self.ssecurity), len(self.service_token),
