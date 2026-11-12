@@ -80,7 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = MiFitnessCoordinator(hass, client, entry)
 
-    # Load stored watermark before first refresh
+    # Load stored state before first refresh
     await coordinator.async_load_stored_state()
 
     try:

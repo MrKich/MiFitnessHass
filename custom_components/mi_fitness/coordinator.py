@@ -5,9 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    statistics_during_period,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -16,11 +22,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import MiFitnessApiError, MiFitnessAuthError, MiFitnessClient
 from .auth import try_silent_token_refresh
 from .const import (
+    CONF_LOGIN_DEVICE_ID,
     CONF_PASS_TOKEN,
     CONF_SERVICE_TOKEN,
     CONF_SSECURITY,
     CONF_USER_ID,
-    DEFAULT_START_WATERMARK,
     DOMAIN,
     KEY_CALORIES,
     KEY_HEART_RATE,
@@ -28,17 +34,32 @@ from .const import (
     KEY_SLEEP,
     KEY_SPO2,
     KEY_STEPS,
+    KEY_STRESS,
     KEY_VITALITY,
     KEY_VALID_STAND,
     KEY_WEIGHT,
+    INITIAL_WINDOW_DAYS,
+    REFRESH_WINDOW_DAYS,
     SCAN_INTERVAL_MINUTES,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
 
+try:
+    from homeassistant.components.recorder.models import StatisticMeanType
+except ImportError:  # HA < 2025.4 — metadata uses has_mean instead
+    StatisticMeanType = None
+
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=SCAN_INTERVAL_MINUTES)
+
+# Readings written to hourly long-term statistics mi_fitness:<metric>_<user_id>
+# as mean/min/max: metric → (name, unit)
+_STATISTICS = {
+    "heart_rate": ("Heart Rate", "bpm"),
+    "spo2":       ("Blood Oxygen (SpO2)", "%"),
+}
 
 # Sleep stage state codes from the API
 _SLEEP_STATE_NAMES = {2: "light", 3: "deep", 4: "rem", 5: "awake"}
@@ -200,16 +221,21 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         self._entry = entry
         self._entry_id = entry.entry_id
         self._store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}")
-        self._watermark: int = 0
-        self._day_wm: int = 0       # watermark saved at start of each new day
-        self._day_num: int = 0      # calendar day when _day_wm was recorded
+        self._day_num: int = 0      # calendar day of the last poll (daily reset)
         self._sensor_data: dict[str, Any] = {}
         self._sleep_history: dict[str, dict] = {}
+        self._sleep_sessions: dict[str, dict] = {}
         self._steps_history: dict[str, dict] = {}
         # Per-day step records keyed by timestamp: {date_str: {ts: {...}}}.
-        # The server re-sends the same interval with a new watermark as data
+        # The server re-sends the same interval again as data accumulates,
         # accumulates, so we DEDUPE by ts (replace) instead of summing.
         self._step_buckets: dict[str, dict] = {}
+        # Readings per metric and UTC hour: {metric: {hour_start_ts: {ts: value}}},
+        # deduped by ts like steps. Feeds the hourly statistics (and today's
+        # heart rate avg/min/max).
+        self._stat_buckets: dict[str, dict] = {}
+        # Days whose step statistics must be rewritten after the next merge
+        self._pending_step_dates: set[str] = set()
         self._initial_load_done: bool = False
         self._fetch_errors: int = 0   # consecutive failed polls → backoff
 
@@ -222,26 +248,20 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         """
         stored = await self._store.async_load()
         if stored:
-            self._watermark     = stored.get("watermark", 0)
-            self._day_wm        = stored.get("day_wm", 0)
             self._day_num       = stored.get("day_num", 0)
             self._sleep_history = stored.get("sleep_history", {})
+            self._sleep_sessions = {
+                str(record["bedtime"]): record
+                for record in self._sleep_history.values() if record.get("bedtime")
+            }
+            self._sleep_sessions.update(stored.get("sleep_sessions", {}))
             self._steps_history = stored.get("steps_history", {})
             self._step_buckets  = stored.get("step_buckets", {})
+            # (re)write step statistics for all stored days on startup — also
+            # backfills installs that had step data before statistics existed
+            self._pending_step_dates = set(self._step_buckets)
+            self._stat_buckets  = stored.get("stat_buckets", {})
             self._sensor_data   = stored.get("sensor_data", {})
-            # On restart roll back to start-of-today so we re-fetch today's data.
-            # (watermark sits at end-of-data; day_wm is start-of-today.)
-            if self._day_wm:
-                self._watermark = self._day_wm
-                # Clear today's step totals — they'll be rebuilt from re-fetched records.
-                # (Avoids double-counting since we accumulate into _steps_history.)
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                self._steps_history.pop(today_str, None)
-                for _k in ("steps_today", "distance_today", "step_calories_today", "steps_hourly"):
-                    self._sensor_data.pop(_k, None)
-            elif self._watermark == 0:
-                # First-ever install: skip ancient history, start ~30 days ago
-                self._watermark = DEFAULT_START_WATERMARK
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch new data from API and merge into sensor state."""
@@ -261,17 +281,20 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
             ):
                 self._sensor_data.pop(_k, None)
 
-        # First refresh: fetch only 1 page to verify connectivity fast
-        # (avoids CancelledError timeout during async_config_entry_first_refresh)
-        # Subsequent polls: 30 pages to catch up through historical data quickly
-        max_pages = 1 if not self._initial_load_done else 30
+        # Read a time window. The legacy incremental endpoint
+        # (get_fitness_data_by_watermark) is a frozen stream for some accounts,
+        # so every poll reads by time range instead: the first one covers
+        # INITIAL_WINDOW_DAYS of history, later ones a short overlap window.
+        days = INITIAL_WINDOW_DAYS if not self._initial_load_done else REFRESH_WINDOW_DAYS
         self._initial_load_done = True
+        end_ts = int(time.time())
+        start_ts = end_ts - days * 86400
 
         try:
-            items, new_wm, errored = await self.hass.async_add_executor_job(
-                self._client.fetch_all_since,
-                self._watermark,
-                max_pages,
+            items, errored = await self.hass.async_add_executor_job(
+                self._client.fetch_window,
+                start_ts,
+                end_ts,
             )
         except MiFitnessAuthError as exc:
             # ── Try silent serviceToken refresh using stored passToken ──────────
@@ -285,15 +308,22 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     "serviceToken expired — attempting silent refresh with passToken"
                 )
                 creds = await self.hass.async_add_executor_job(
-                    try_silent_token_refresh, pass_token, user_id
+                    try_silent_token_refresh, pass_token, user_id,
+                    self._entry.data.get(CONF_LOGIN_DEVICE_ID, ""),
                 )
                 if creds.get("service_token"):
-                    new_data = {**self._entry.data, CONF_SERVICE_TOKEN: creds["service_token"]}
+                    new_data = dict(self._entry.data)
+                    refreshed_tokens = {
+                        CONF_PASS_TOKEN: creds.get("pass_token"),
+                        CONF_SERVICE_TOKEN: creds.get("service_token"),
+                        CONF_SSECURITY: creds.get("ssecurity"),
+                    }
+                    for key, value in refreshed_tokens.items():
+                        if value and value != self._entry.data.get(key):
+                            new_data[key] = value
+
                     if creds.get("ssecurity"):
-                        new_data[CONF_SSECURITY] = creds["ssecurity"]
                         self._client.ssecurity = creds["ssecurity"]
-                    # Do NOT update passToken — server rotates it on each exchange,
-                    # and the new passToken gives different (wrong) ssecurity.
                     self._client.update_service_token(creds["service_token"])
                     self.hass.config_entries.async_update_entry(self._entry, data=new_data)
                     _LOGGER.warning("Silent refresh succeeded — resuming on next poll")
@@ -310,27 +340,12 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         except MiFitnessApiError as exc:
             raise UpdateFailed(str(exc)) from exc
 
-        if new_wm and new_wm != self._watermark:
-            self._watermark = new_wm
-            today = _local_day_num()
-            if today != self._day_num:
-                # New day — snapshot watermark so restart can roll back to here
-                self._day_wm  = new_wm
-                self._day_num = today
-            await self._store.async_save({
-                "watermark":     new_wm,
-                "day_wm":        self._day_wm,
-                "day_num":       self._day_num,
-                "sleep_history": self._sleep_history,
-                "steps_history": self._steps_history,
-                "step_buckets":  self._step_buckets,
-                "sensor_data":   self._sensor_data,
-            })
-
         # Dynamic interval: catching up → 30 s, up to date → 15 min,
         # repeated failures → exponential backoff (don't hammer a rate-limit).
         if items:
             self._merge_items(items)
+            if self._pending_step_dates:
+                await self._import_step_statistics()
             self._fetch_errors = 0
             latest_ts = max(
                 (item.get("time") or item.get("update_time") or 0) for item in items
@@ -362,6 +377,21 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     "Mi Fitness: caught up, switching to %s min interval",
                     SCAN_INTERVAL_MINUTES,
                 )
+
+        # Persist merged state so a restart keeps what this poll produced.
+        today = _local_day_num()
+        if today != self._day_num:
+            self._day_num = today
+        await self._store.async_save({
+            "day_num":        self._day_num,
+            "sleep_history":  self._sleep_history,
+            "sleep_sessions": self._sleep_sessions,
+            "steps_history":  self._steps_history,
+            "step_buckets":   self._step_buckets,
+            "stat_buckets":   self._stat_buckets,
+            "sensor_data":    self._sensor_data,
+        })
+
         return dict(self._sensor_data)
 
     def _merge_items(self, items: list[dict]) -> None:
@@ -371,7 +401,8 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         tomorrow  = today + 86400
 
         # Cutoffs: ignore stale data for sensor VALUES.
-        # The watermark still advances so we never re-fetch these items.
+        # The window is re-read on every poll, so items outside these cutoffs
+        # are merged into history/statistics only, never into current values.
         # "recent" sensors (HR, sleep, vitality): 14 days
         # "infrequent" sensors (weight, SpO2): 90 days
         recent_cutoff = now - 14 * 86400
@@ -379,7 +410,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
 
         touched_step_dates: set[str] = set()
         calories_today: list[dict] = []
-        hr_readings: list[dict] = []
+        touched_hours: dict[str, set[str]] = {}
         stand_hours_today_set: set[int] = set()
 
         for item in items:
@@ -397,7 +428,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                         date_str, hour, val.get("steps"), val.get("distance"),
                     )
                     # Dedupe by timestamp: the server re-sends the same interval
-                    # with a new watermark as data accumulates. REPLACE (not add),
+                    # The server re-sends the same interval as data accumulates. REPLACE (not add),
                     # otherwise a day inflates by the number of re-sends.
                     day = self._step_buckets.setdefault(date_str, {})
                     day[str(ts)] = {
@@ -417,8 +448,8 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     self._sensor_data["heart_rate"]      = val["bpm"]
                     self._sensor_data["heart_rate_ts"]   = ts
                     self._sensor_data["heart_rate_type"] = val.get("type", 0)
-                if today <= ts < tomorrow:
-                    hr_readings.append(val)
+                if isinstance(val, dict) and val.get("bpm"):
+                    self._add_reading("heart_rate", ts, val["bpm"], touched_hours)
 
             # ── Resting heart rate ────────────────────────────────────────
             elif key == KEY_RESTING_HEART_RATE:
@@ -431,7 +462,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
 
             # ── Sleep ─────────────────────────────────────────────────────
             elif key == KEY_SLEEP:
-                if ts >= recent_cutoff:
+                if ts >= now - 30 * 86400:
                     self._process_sleep(val, ts)
 
             # ── Calories ──────────────────────────────────────────────────
@@ -458,6 +489,20 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     if spo2_val:
                         self._sensor_data["spo2"]    = spo2_val
                         self._sensor_data["spo2_ts"] = ts
+                if ts >= recent_cutoff and isinstance(val, dict) and val.get("spo2"):
+                    self._add_reading("spo2", ts, val["spo2"], touched_hours)
+
+            # ── Stress ────────────────────────────────────────────────────
+            elif key == KEY_STRESS:
+                if ts < recent_cutoff:
+                    continue
+                if not isinstance(val, dict) or val.get("stress") is None:
+                    continue
+                # 0 is a valid reading; prefer the measurement's own timestamp
+                stress_ts = val.get("time") or ts
+                if stress_ts > self._sensor_data.get("stress_ts", 0):
+                    self._sensor_data["stress"]    = val["stress"]
+                    self._sensor_data["stress_ts"] = stress_ts
 
             # ── Vitality ──────────────────────────────────────────────────
             elif key == KEY_VITALITY:
@@ -477,6 +522,7 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
 
         # Steps: rebuild day totals from deduped buckets (sum of unique-ts values)
         if touched_step_dates:
+            self._pending_step_dates |= touched_step_dates
             # prune buckets older than 14 days
             cutoff_str = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
             self._step_buckets = {
@@ -515,8 +561,20 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                 v.get("calories", 0) for v in calories_today if isinstance(v, dict)
             )
 
-        if hr_readings:
-            bpms = [v["bpm"] for v in hr_readings if isinstance(v, dict) and v.get("bpm")]
+        for metric, hours in touched_hours.items():
+            self._import_statistics(metric, hours)
+            # keep 2 days: enough for today's values and late re-sends
+            self._stat_buckets[metric] = {
+                h: b for h, b in self._stat_buckets[metric].items() if int(h) >= today - 86400
+            }
+
+        if "heart_rate" in touched_hours:
+            bpms = [
+                bpm
+                for h, b in self._stat_buckets["heart_rate"].items()
+                if today <= int(h) < tomorrow
+                for bpm in b.values()
+            ]
             if bpms:
                 self._sensor_data["heart_rate_avg_today"] = round(sum(bpms) / len(bpms))
                 self._sensor_data["heart_rate_max_today"] = max(bpms)
@@ -531,8 +589,99 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         # Rebuild history + compute chronotype from full history (not single night)
         history_list = self._build_sleep_history_list()
         self._sensor_data["sleep_history_14d"] = history_list
+        self._sensor_data["sleep_sessions_30d"] = sorted(
+            self._sleep_sessions.values(), key=lambda record: record["bedtime"], reverse=True
+        )
         if history_list:
             self._sensor_data["sleep_chronotype"] = _sleep_chronotype_6(history_list)
+
+    def _add_reading(
+        self, metric: str, ts: int, value: float, touched: dict[str, set[str]]
+    ) -> None:
+        """Store a reading in its hour bucket (replacing re-sends of the same ts)."""
+        hour = str(ts - ts % 3600)
+        self._stat_buckets.setdefault(metric, {}).setdefault(hour, {})[str(ts)] = value
+        touched.setdefault(metric, set()).add(hour)
+
+    def _import_statistics(self, metric: str, hours: set[str]) -> None:
+        """Write hourly mean/min/max of a metric as external long-term statistics.
+
+        The sensors only show the latest reading per poll; this keeps every
+        reading the band synced, so graphs show the full curve.
+        """
+        name, unit = _STATISTICS[metric]
+        metadata = self._statistic_metadata(metric, name, unit, has_sum=False)
+        statistics: list[StatisticData] = []
+        for hour in sorted(hours, key=int):
+            values = list(self._stat_buckets[metric][hour].values())
+            statistics.append(StatisticData(
+                start=datetime.fromtimestamp(int(hour), tz=timezone.utc),
+                mean=sum(values) / len(values),
+                min=min(values),
+                max=max(values),
+            ))
+        async_add_external_statistics(self.hass, metadata, statistics)
+
+    async def _import_step_statistics(self) -> None:
+        """Write hourly steps as the cumulative statistic mi_fitness:steps_<user_id>.
+
+        Graphs show daily steps with stat type "change". Unlike the
+        steps_today sensor, this is not skewed by the partial re-fetch after
+        a restart, and it covers the days fetched before the sensor existed.
+        Rewrites everything from the earliest touched day on, continuing
+        the sum from the last row before it.
+        """
+        first_day = min(self._pending_step_dates)
+        self._pending_step_dates = set()
+        hours: dict[int, int] = {}
+        for date_str, buckets in self._step_buckets.items():
+            if date_str < first_day:
+                continue
+            for ts, b in buckets.items():
+                hour = int(ts) - int(ts) % 3600
+                hours[hour] = hours.get(hour, 0) + b["steps"]
+        if not hours:
+            return
+
+        metadata = self._statistic_metadata("steps", "Steps", "steps", has_sum=True)
+        start = datetime.fromtimestamp(min(hours), tz=timezone.utc)
+        before = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass, start - timedelta(days=30), start,
+            {metadata["statistic_id"]}, "hour", None, {"sum"},
+        )
+        rows = before.get(metadata["statistic_id"])
+        total = (rows[-1].get("sum") or 0) if rows else 0
+
+        statistics: list[StatisticData] = []
+        for hour in sorted(hours):
+            total += hours[hour]
+            statistics.append(StatisticData(
+                start=datetime.fromtimestamp(hour, tz=timezone.utc),
+                state=hours[hour],
+                sum=total,
+            ))
+        async_add_external_statistics(self.hass, metadata, statistics)
+
+    def _statistic_metadata(
+        self, metric: str, name: str, unit: str, has_sum: bool
+    ) -> StatisticMetaData:
+        user_id = self._entry.data.get(CONF_USER_ID, "")
+        metadata: StatisticMetaData = {
+            "has_sum":             has_sum,
+            "name":                f"Mi Fitness ({user_id}) {name}",
+            "source":              DOMAIN,
+            "statistic_id":        f"{DOMAIN}:{metric}_{user_id}",
+            "unit_of_measurement": unit,
+        }
+        if StatisticMeanType is not None:
+            metadata["mean_type"] = (
+                StatisticMeanType.NONE if has_sum else StatisticMeanType.ARITHMETIC
+            )
+            metadata["unit_class"] = None
+        else:
+            metadata["has_mean"] = not has_sum
+        return metadata
 
     # ── Sleep processing ──────────────────────────────────────────────────────
 
@@ -544,13 +693,23 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         if not bedtime:
             return
 
-        # Only update current sleep record if this is newer
-        prev_bedtime = self._sensor_data.get("sleep_bedtime", 0)
-        if bedtime <= prev_bedtime:
-            return
-
         wakeup      = val.get("wake_up_time", 0)
+
+        # Only update current sleep record if this is newer. The server keeps
+        # extending a night after interruptions: it deletes the old record and
+        # re-sends it with the SAME bedtime and a later wakeup, so compare both.
+        prev_bedtime = self._sensor_data.get("sleep_bedtime", 0)
+        prev_wakeup  = self._sensor_data.get("sleep_wakeup", 0)
+        if bedtime <= prev_bedtime and wakeup <= prev_wakeup:
+            return
+        # A merged record may start on an earlier date than the one it replaces
+        if prev_bedtime and bedtime < prev_wakeup:
+            prev_date = datetime.fromtimestamp(prev_bedtime).strftime("%Y-%m-%d")
+            self._sleep_history.pop(prev_date, None)
+
         duration    = val.get("duration", 0)
+        if not wakeup or wakeup <= bedtime or duration <= 0:
+            return
         deep        = val.get("sleep_deep_duration", 0)
         light       = val.get("sleep_light_duration", 0)
         rem         = val.get("sleep_rem_duration", val.get("rem_duration", 0))
@@ -564,6 +723,32 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
         stages     = _stages_to_list(stages_raw) if stages_raw else []
         time_in_bed = (wakeup - bedtime) / 60 if wakeup > bedtime else duration
         efficiency  = round(duration / time_in_bed * 100) if time_in_bed > 0 else 0
+
+        session_key = str(bedtime)
+        previous = self._sleep_sessions.get(session_key, {})
+        if ts < previous.get("updated_at", 0):
+            return
+        self._sleep_sessions[session_key] = {
+            "bedtime": bedtime, "wakeup": wakeup, "duration": duration,
+            "deep": deep, "light": light, "rem": rem,
+            "awake_count": awake_count, "quality": quality,
+            "efficiency": efficiency, "updated_at": ts,
+            "is_uncomplete": bool(val.get("is_uncomplete", False)),
+            "in_bed_at": val.get("bed_timestamp"),
+            "out_of_bed_at": val.get("out_bed_timestamp"),
+        }
+        cutoff_ts = time.time() - 30 * 86400
+        self._sleep_sessions = {
+            key: record for key, record in self._sleep_sessions.items()
+            if record["wakeup"] >= cutoff_ts
+        }
+
+        # Archive every session; current sensors track the most recent bedtime.
+        prev_bedtime = self._sensor_data.get("sleep_bedtime", 0)
+        if bedtime < prev_bedtime or (
+            bedtime == prev_bedtime and ts < self._sensor_data.get("sleep_ts", 0)
+        ):
+            return
 
         self._sensor_data.update({
             "sleep_bedtime":     bedtime,

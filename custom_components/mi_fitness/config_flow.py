@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import voluptuous as vol
@@ -36,6 +37,7 @@ from .const import (
     AUTH_METHOD_TOKENS,
     CONF_AUTH_METHOD,
     CONF_C_USER_ID,
+    CONF_LOGIN_DEVICE_ID,
     CONF_PASS_TOKEN,
     CONF_PASSWORD,
     CONF_PHONE_ID,
@@ -63,7 +65,13 @@ async def _test_tokens(hass, data: dict) -> None:
         service_token=data[CONF_SERVICE_TOKEN],
         region=data.get(CONF_REGION, DEFAULT_REGION),
     )
-    await hass.async_add_executor_job(client.get_health_data, 0, 1)
+    # A single small window is enough to prove the session works: it exercises
+    # the signed POST transport and the session cookies against the real data
+    # endpoint.
+    end_ts = int(time.time())
+    await hass.async_add_executor_job(
+        client.fetch_key_window, "steps", end_ts - 2 * 86400, end_ts
+    )
 
 
 # ── Config flow ───────────────────────────────────────────────────────────────
@@ -300,6 +308,9 @@ class MiFitnessConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_REGION:        self._region,
             CONF_USERNAME:      self._username,
             CONF_PASSWORD:      self._password,
+            # Persist the deviceId used during login (and its trusted 2FA) so future
+            # logins / silent refreshes reuse it and avoid re-triggering 2FA.
+            CONF_LOGIN_DEVICE_ID: self._login_session.device_id,
         }
         if getattr(result, "pass_token", ""):
             entry_data[CONF_PASS_TOKEN] = result.pass_token
@@ -327,7 +338,9 @@ class MiFitnessConfigFlow(ConfigFlow, domain=DOMAIN):
             if username and password:
                 self._username = username
                 self._password = password
-                ls = XiaomiLoginSession()
+                ls = XiaomiLoginSession(
+                    self._reauth_entry.data.get(CONF_LOGIN_DEVICE_ID, "")
+                )
                 self._login_session = ls
                 try:
                     result: LoginResult = await self.hass.async_add_executor_job(
@@ -383,7 +396,10 @@ class MiFitnessConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 self._username = user_input[CONF_USERNAME]
                 self._password = user_input[CONF_PASSWORD]
-                self._login_session = XiaomiLoginSession()
+                _entry = getattr(self, "_reauth_entry", None)
+                self._login_session = XiaomiLoginSession(
+                    _entry.data.get(CONF_LOGIN_DEVICE_ID, "") if _entry else ""
+                )
                 try:
                     result: LoginResult = await self.hass.async_add_executor_job(
                         self._login_session.start, self._username, self._password
@@ -536,6 +552,10 @@ class MiFitnessConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_USERNAME:      username,
             CONF_PASSWORD:      password,
         }
+        # Persist the deviceId actually used by this re-auth session (legacy entries
+        # have none; the trusted 2FA is bound to it).
+        if getattr(self, "_login_session", None) is not None:
+            new_data[CONF_LOGIN_DEVICE_ID] = self._login_session.device_id
         if new_pass_token:
             new_data[CONF_PASS_TOKEN] = new_pass_token
         self.hass.config_entries.async_update_entry(entry, data=new_data)
