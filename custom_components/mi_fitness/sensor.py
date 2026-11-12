@@ -338,6 +338,9 @@ class MiFitnessSensor(CoordinatorEntity[MiFitnessCoordinator], SensorEntity):
             history = data.get("sleep_history_14d")
             if history:
                 attrs["history_14d"] = history
+            sessions = data.get("sleep_sessions_30d")
+            if sessions:
+                attrs["sessions_30d"] = sessions
 
         elif key == "sleep_chronotype":
             _ANIMAL_EMOJI = {
